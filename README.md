@@ -1,124 +1,81 @@
 # 1000.menu Dual-Worker Scraper
 
-High-volume 1000.menu scraper built around two cooperative workers:
+Headless scraper that exports high-quality recipe datasets from 1000.menu. The project focuses on dependable long‑running crawls: a Playwright collector keeps paginating the public search page, while an async HTTP fetcher parses each unique recipe only once and writes structured TSV/JSONL output.
 
-1. **Link collector** – a lightweight Playwright session that sits on the public search page, keeps pressing “Показать еще результаты поиска…”, and sends every discovered recipe URL into a persistent queue.
-2. **Recipe fetcher** – a fast `httpx` client that pops URLs from the queue, fetches them without spinning up a browser, parses the HTML with `selectolax`, and writes structured rows every 500 recipes.
+See `docs/README.md` for the full architecture notes; this document concentrates on the why/how of running it.
 
-The pipeline is fault tolerant (SQLite-backed queue, resumable collector state, duplicate suppression) and exports a nutrition-rich TSV/JSONL payload optimized for downstream analytics.
+## What You Get
+- **Browser-grade discovery** – real Chromium session clicks “Показать ещё результаты…” so the dataset matches what a human sees.
+- **HTTP-speed parsing** – recipes are fetched with `httpx` + `selectolax`, stripping ads/HTML leftovers and emitting nutrition data.
+- **Exactly-once semantics** – SQLite queue (pending/leased/processed/failed) plus file writers keep outputs deduplicated even across crashes.
+- **Operational milestones** – collectors log every 2 000 unique links; fetchers log every 200 parsed recipes so you can monitor with `LOG_LEVEL=WARNING`.
 
-## Quick start
+## Deploying the Scraper
+
+### Local development (uv-powered)
 ```bash
-cd /Users/Bogodist/parsing_for_uni
-make setup                       # venv, deps, Chromium for the collector
+git clone https://github.com/playful-chef/recipe-parser.git
+cd recipe-parser
+make setup          # creates .venv, installs deps via uv, installs Chromium
 
-# Terminal 1 – keep discovering recipe links
-.venv/bin/python -m src.main collect-links --max-clicks 50
+# Terminal 1 – discover links
+.venv/bin/python -m src.main collect-links \
+  --mode browser \
+  --click-delay 0.05 \
+  --scroll-pause 0.01
 
-# Terminal 2 – drain the queue and emit recipes every 500 rows
+# Terminal 2 – fetch + parse
 .venv/bin/python -m src.main fetch-recipes \
   --output-file data/output/recipes.tsv \
-  --jsonl-file data/output/recipes.jsonl
+  --jsonl-file data/output/recipes.jsonl \
+  --flush-size 500
 ```
 
-Both commands can run indefinitely; stop/restart them at will. Progress lives in:
+Both workers can be restarted independently; state lives under `state/`.
 
-- `state/workqueue.db` – SQLite queue (`pending`, `leased`, `processed`, `failed`)
-- `state/collector_state.json` – remembers how many “load more” clicks have already been replayed
-- `data/output/recipes.tsv` (+ optional JSONL mirror)
-
-## CLI overview
-
-| Command | Description |
-| --- | --- |
-| `python -m src.main collect-links` | Launches Playwright (headless by default), opens the search page, keeps clicking “Показать еще результаты…” and pushes canonical recipe URLs into the queue. |
-| `python -m src.main fetch-recipes` | Uses async `httpx` to fetch/parse recipe pages in parallel, exporting batched TSV/JSONL rows every `--flush-size` recipes while acknowledging URLs in the queue. |
-
-### Common options
-| Flag / env | Meaning | Default |
-| --- | --- | --- |
-| `--base-url`, `SCRAPER_BASE_URL` | Site root | `https://1000.menu` |
-| `--search-path`, `SCRAPER_SEARCH_PATH` | Search endpoint used by the collector | `/cooking/search?ms=1&str=&es_tf=0&es_tt=14&es_cf=0&es_ct=2000` |
-| `--state-dir`, `SCRAPER_STATE_DIR` | Persistent state directory | `state/` |
-| `--output-file`, `SCRAPER_OUTPUT_FILE` | TSV target (parent directory becomes `data_dir`) | `data/output/recipes.tsv` |
-| `--jsonl-file`, `SCRAPER_JSONL_FILE` | Optional JSONL mirror | unset |
-| `--progress-interval`, `SCRAPER_PROGRESS_INTERVAL` | Log every N parsed recipes (fetcher) | `200` |
-
-### Collector highlights
-- `--max-clicks` caps how many **new** “load more” clicks happen per run (defaults to infinite).
-- `--click-delay` and `--scroll-pause` keep things polite for the site.
-- Resuming a stopped collector replays the previously completed click count so pagination state stays consistent; duplicates are ignored by the queue.
-- `--mode auto|browser|http` lets you force a strategy. `auto` (default) tries Playwright first but automatically falls back to an HTTP paginator that scrapes the same AJAX endpoints the “Показать ещё результаты…” button uses—handy when the UI page gets stuck on a perpetual loader inside slower environments (Docker, CI, etc.).
-
-### Fetcher highlights
-- `--batch-size` controls how many URLs are leased from the queue at a time (default 20).
-- `--http-concurrency` limits the number of simultaneous downloads (default 8).
-- `--flush-size` controls how many parsed recipes are buffered before being written (default 500).
-- `--progress-interval` (200 by default) prints a milestone log plus a flush summary every time that many recipes have been parsed—handy for long unattended runs even at higher log levels such as WARNING.
-- `--max-failures` determines how many times a URL is retried before it’s moved to the `failed` bucket.
-
-## Data schema (`data/output/recipes.tsv`)
-The TSV writer adds headers once and appends batches of 500 rows:
-
-1. `title`
-2. `instructions` (newline-separated steps)
-3. `ingredients` (comma-separated list)
-4. `url`
-5. `description`
-6. `author`
-7. `total_time`
-8. `servings`
-9. `calories`
-10. `rating_value`
-11. `rating_count`
-12. `categories` (breadcrumb trail without “Главная”)
-13. `equipment`
-14. `tags`
-15. `image`
-16. `captured_at` (UTC ISO-8601)
-17. `protein_percent`
-18. `protein_grams`
-19. `fat_percent`
-20. `fat_grams`
-21. `carb_percent`
-22. `carb_grams`
-23. `calories_per_100g`
-24. `calories_total` (derived from total weight + per‑100g kcal)
-25. `gi_min`
-26. `gi_avg`
-27. `gi_max`
-28. `total_weight_grams`
-
-Nutrition fields are parsed from the “Нутриенты и калорийность состава рецепта” widget (per 100 g by default) and mirrored in JSONL outputs. Already-exported URLs are checked via the queue before writing, guaranteeing idempotent reruns even if TSV files are deleted.
-
-## Testing & linting
+### Docker Compose (recommended for production runs)
 ```bash
-.venv/bin/python -m pytest          # unit tests + parser fixtures
+# build uv-based image
+docker compose build
+
+# start both workers in parallel
+docker compose up -d collector fetcher
+
+# follow progress at log level WARNING
+docker compose logs -f collector fetcher
+
+# clean stop + wipe state volume
+docker compose down -v
+```
+`data/` is bind-mounted to the host so TSV/JSONL files update live; the SQLite queue sits in the named volume `state-data` and survives container restarts unless you pass `-v`.
+
+### Clean restarts
+If you need a fully fresh crawl:
+```bash
+docker compose down -v
+rm -rf data/output state/collector_state.json
+mkdir -p data/output state && touch data/.gitkeep state/.gitkeep
+docker compose up -d collector fetcher
+```
+
+## Runtime Artifacts
+- `data/output/recipes.tsv` – canonical dataset with headers; each row carries full text, nutrition, and metadata fields.
+- `data/output/recipes.jsonl` – optional mirroring of every record for streaming ingestion.
+- `state/workqueue.db` – queue plus per-link attempts.
+- `state/collector_state.json` – remembers how many “load more” clicks already happened to resume pagination.
+
+## Tips & Troubleshooting
+- **Timeout warnings** – tune `--results-wait-timeout` (or `SCRAPER_RESULTS_WAIT_TIMEOUT`) so Playwright waits long enough after each click.
+- **Collector stuck?** – run `collect-links --mode http` to fall back to the AJAX endpoint; the queue prevents duplicate processing.
+- **Throttling** – reduce `--click-delay`, `--scroll-pause`, or `--http-concurrency` if the site pushes back; increase when you need throughput.
+- **Milestones show duplicates?** – the collector only increments progress when `LinkStore.add_links` reports new unique URLs, so repeated warnings usually point to slow link growth rather than logging errors.
+- **Need deeper internals?** – read `docs/README.md` for a component breakdown, diagrams, and extension ideas.
+
+## Contributing & Testing
+```bash
+.venv/bin/python -m pytest
 .venv/bin/python -m ruff format src tests
 .venv/bin/python -m ruff check src tests
 ```
 
-## Docker / Compose
-Launch both workers together with Docker Compose (the `data/` directory is bind-mounted so TSV/JSONL files stay on the host, while the SQLite queue lives inside a persistent named volume for durability). The default `LOG_LEVEL` inside the containers is `WARNING`, so you will mainly see milestone entries (flush + progress) instead of every HTTP call:
-```bash
-# build the image once
-docker compose build
-
-# run both workers in parallel (detached)
-docker compose up -d collector fetcher
-
-# follow logs if needed
-docker compose logs -f collector fetcher
-
-# stop everything
-docker compose down
-```
-The state volume is called `parsing_for_uni_state-data`; inspect it with `docker compose exec collector ls /app/state` or `docker compose exec fetcher python -m sqlite3 /app/state/workqueue.db ...`.
-
-## Operational notes
-- Respect 1000.menu’s robots.txt; keep `--click-delay`, `--scroll-pause`, and `--http-concurrency` conservative for long crawls.
-- The queue guarantees “exactly once” writing: processed URLs are never re-fetched, failed ones are retried with exponential backoff, and everything is crash-safe thanks to SQLite + JSON checkpoints.
-- Clearing state for a clean run is as simple as deleting `state/workqueue.db` and `state/collector_state.json`.
-- If the search page refuses to finish loading in a headless browser, rerun `collect-links` with `--mode http` to iterate directly over the `/ajax/free/search_page` endpoint until no more cards are returned.
-
-
+The repository is structured for long-lived scrapes; prefer incremental tuning (via config) over editing worker code unless you are changing site logic. Pull requests that improve parsing accuracy, monitoring, or deployment ergonomics are welcome.
