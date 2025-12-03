@@ -1,0 +1,40 @@
+x-scraper-shared: &scraper-shared
+  image: recipe-scraper:latest
+  environment:
+    LOG_LEVEL: WARNING
+    SCRAPER_DISABLE_WAL: "1"
+    SCRAPER_PROGRESS_INTERVAL: "1000"
+    SCRAPER_BATCH_SIZE: "200"
+    SCRAPER_HTTP_CONCURRENCY: "50"
+  volumes:
+    - ./data:/app/data
+    - state-data:/app/state
+
+services:
+  collector:
+    <<: *scraper-shared
+    build: .
+    command:
+      - collect-links
+      - --mode
+      - browser
+      - --click-delay
+      - "0.05"
+      - --scroll-pause
+      - "0.01"
+      - --results-wait-timeout
+      - "15"
+
+  fetcher:
+    <<: *scraper-shared
+    depends_on:
+      - collector
+    command:
+      - fetch-recipes
+      - --jsonl-file
+      - /app/data/output/recipes.jsonl
+      - --flush-size
+      - "2000"
+
+volumes:
+  state-data:
